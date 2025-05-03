@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/dicedb/dicedb-go/wire"
-	"github.com/google/uuid"
 )
 
 const maxResponseSize = 32 * 1024 * 1024 // 32 MB
@@ -23,6 +22,7 @@ type Client struct {
 	watchCh      chan *wire.Result
 	host         string
 	port         int
+	wg           *sync.WaitGroup
 }
 
 type option func(*Client)
@@ -33,7 +33,7 @@ func WithID(id string) option {
 	}
 }
 
-func NewClient(host string, port int, opts ...option) (*Client, error) {
+func NewClient(host string, port int, wg *sync.WaitGroup, opts ...option) (*Client, error) {
 	mainRetrier := NewRetrier(3, 5*time.Second)
 	clientWire, err := ExecuteWithResult(mainRetrier, []wire.ErrKind{wire.NotEstablished}, func() (*ClientWire, *wire.WireError) {
 		return NewClientWire(maxResponseSize, host, port)
@@ -52,6 +52,7 @@ func NewClient(host string, port int, opts ...option) (*Client, error) {
 		mainWire:    clientWire,
 		host:        host,
 		port:        port,
+		wg:          wg,
 	}
 
 	for _, opt := range opts {
@@ -59,7 +60,7 @@ func NewClient(host string, port int, opts ...option) (*Client, error) {
 	}
 
 	if client.id == "" {
-		client.id = uuid.New().String()
+		client.id = "uuid.New().String()"
 	}
 
 	if resp := client.Fire(&wire.Command{
@@ -110,6 +111,14 @@ func (c *Client) fire(cmd *wire.Command, clientWire *ClientWire) *wire.Result {
 }
 
 func (c *Client) Fire(cmd *wire.Command) *wire.Result {
+	if cmd.Cmd == "GET" && len(cmd.Args) > 0 {
+		c.wg.Add(1)
+		go func() {
+			Subscribe(c, cmd.Args[0])
+			c.wg.Done()
+		}()
+	}
+
 	return c.fire(cmd, c.mainWire)
 }
 
@@ -201,4 +210,29 @@ func (c *Client) restoreWire(dst *ClientWire) *wire.WireError { // nolint:static
 
 func noop() *wire.WireError {
 	return nil
+}
+
+func Subscribe(client *Client, watch_key string) {
+	resp := client.Fire(&wire.Command{
+		Cmd:  "GET.WATCH",
+		Args: []string{watch_key},
+	})
+	if resp.Status == wire.Status_ERR {
+		fmt.Println("error subscribing:", resp.Message)
+	}
+}
+
+func ListenForMessages(client *Client, onMessage func(message string)) {
+	ch, err := client.WatchCh()
+	if err != nil {
+		panic(err)
+	}
+	for resp := range ch {
+		fmt.Println("Received message resparito:", resp)
+		if resp.Status == wire.Status_ERR {
+			fmt.Println("error listening for messages:", resp.Message)
+		} else {
+			onMessage(resp.GetMessage())
+		}
+	}
 }
